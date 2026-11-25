@@ -1,5 +1,18 @@
 # Change log
 
+## Unreleased (issue #7: Ivy Bridge / Sandy Bridge illegal instruction)
+
+- **Pre-Haswell CPUs no longer die at `libc.prx+0x2f988`.** The runtime logs the host CPU sets at startup
+  (`CPU check: ...`), dumps the 16 faulting bytes plus `rflags` on every `STATUS_ILLEGAL_INSTRUCTION`/`SIGILL`,
+  and emulates the faulting Haswell instructions in place: `MOVBE` and BMI1 `ANDN/BEXTR/BLSI/BLSMSK/BLSR`
+  (`runtime/jstars_isa.c`, `--cpu-features` prints `CPU: ...`). `LZCNT/TZCNT` cannot be trapped (they run as
+  `BSR/BSF` on old CPUs) and are reported as missing for a future static rewrite. Flag semantics match Intel SDM
+  as validated in SpartanPort `src/isa_emulate.c`.
+- New `--selftest-host` vectors cover the emulator with fixed byte sequences (no host BMI1/MOVBE needed).
+  (2026-11-24: fixed after the first Windows run on Ivy Bridge — the VEX length gate rejected
+  5-byte register forms, LZCNT/TZCNT used MOVBE's ModRM index, and the MOVBE-load vector
+  expected the unswapped value; plus the REX.B `[R13]+disp32` length edge.)
+
 ## 0.5.4 playtest preview (pre-release)
 
 - **Smoother frame pacing.** At 60 fps, frames alternated between 16 and 31 ms (Windows' 15.6 ms timer tick): the renderer's frame loop
