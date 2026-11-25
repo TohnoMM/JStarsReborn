@@ -5,6 +5,7 @@
 # Output: <out-dir>/JStarsReborn-<version>/ and <out-dir>/JStarsReborn-<version>-win64.zip. The script only builds; it uploads nothing.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
+rel_base=$(basename "$here") # directory name of this source tree (usually JStarsReborn)
 gpu_lib=$(realpath "${1:?path to the Windows libjstars_gpu.a}")
 out=$(realpath -m "${2:-$here/build/release}")
 version=$(sed -n 's/.*launcher_version = "\([0-9.]*\)".*/\1/p' "$here/src/launcher/launcher_core.hpp")
@@ -18,8 +19,21 @@ echo "== launcher"
 "$here/tools/build_launcher.sh" >/dev/null
 cp "$here/build/launcher/JStarsReborn.exe" "$rel/JStarsReborn.exe"
 echo "== runtime"
-make -C "$here/runtime" jstars-boot-gpu.exe GPU_LIB_WIN="$gpu_lib" >/dev/null 2>"$out/runtime-link.log" || { grep -E "error|undefined" "$out/runtime-link.log" | head; exit 1; }
+# Force relink: make only looks at file timestamps, so switching FFMPEG_DIR on/off
+# would otherwise keep packaging a stale jstars-boot-gpu.exe.
+rm -f "$here/runtime/jstars-boot-gpu.exe"
+ffmpeg_make_args=()
+if [ -n "${FFMPEG_WIN_DIR:-}" ]; then
+  # Windows FFmpeg shared tree (BtbN win64-lgpl-shared: include/ + bin/*.dll): enables real movie
+  # decoding in the runtime (docs/MOVIES.md). Unset = movies are skipped, as before.
+  ffmpeg_make_args+=(FFMPEG_DIR="$FFMPEG_WIN_DIR")
+fi
+make -C "$here/runtime" jstars-boot-gpu.exe GPU_LIB_WIN="$gpu_lib" "${ffmpeg_make_args[@]}" >/dev/null 2>"$out/runtime-link.log" || { grep -E "error|undefined" "$out/runtime-link.log" | head; exit 1; }
 cp "$here/runtime/jstars-boot-gpu.exe" "$rel/runtime/jstars-runtime.exe"
+if [ -n "${FFMPEG_WIN_DIR:-}" ]; then
+  cp "$FFMPEG_WIN_DIR"/bin/*.dll "$rel/runtime/"
+  cp "$FFMPEG_WIN_DIR"/LICENSE.txt "$rel/LICENSES/FFmpeg-LICENSE.txt"
+fi
 cp "$here/packaging/runtime-README.txt" "$rel/runtime/README.txt"
 
 echo "== documents and licenses"
@@ -43,11 +57,11 @@ sed -n '/^This software is available under 2 licenses/,$p' "$v/stb/stb_image_wri
 sed -n '1,25p' "$v/renderdoc/renderdoc_app.h" > "$rel/LICENSES/third-party/renderdoc_app-LICENSE.txt" || true
 
 echo "== source"
-tar -C "$here/.." --exclude-vcs --exclude='JStarsReborn/.git*' --exclude='JStarsReborn/build' --exclude='JStarsReborn/runtime/*.exe' --exclude='JStarsReborn/runtime/jstars-boot' \
-    --exclude='JStarsReborn/runtime/jstars-boot-gpu' --exclude='JStarsReborn/runtime/*.log' --exclude='JStarsReborn/runtime/*.selftest' \
-    --exclude='JStarsReborn/runtime/obj*' --exclude='JStarsReborn/JStarsReborn.exe' --exclude='JStarsReborn/JStarsSetup.exe' \
-    --exclude='JStarsReborn/tools/vkprobe/vkprobe.exe' --exclude='JStarsReborn/evidence' --exclude='*/__pycache__' \
-    --exclude='JStarsReborn/gpu/build*' -czf "$rel/source/JStarsReborn-$version-source.tar.gz" JStarsReborn
+tar -C "$here/.." --exclude-vcs --exclude="$rel_base/.git*" --exclude="$rel_base/build" --exclude="$rel_base/runtime/*.exe" --exclude="$rel_base/runtime/jstars-boot" \
+    --exclude="$rel_base/runtime/jstars-boot-gpu" --exclude="$rel_base/runtime/*.log" --exclude="$rel_base/runtime/*.selftest" \
+    --exclude="$rel_base/runtime/obj*" --exclude="$rel_base/JStarsReborn.exe" --exclude="$rel_base/JStarsSetup.exe" \
+    --exclude="$rel_base/tools/vkprobe/vkprobe.exe" --exclude="$rel_base/evidence" --exclude='*/__pycache__' \
+    --exclude="$rel_base/gpu/build*" -czf "$rel/source/$rel_base-$version-source.tar.gz" "$rel_base"
 cp "$here/docs/BUILD_RELEASE.md" "$rel/source/BUILD.md"
 
 echo "== version and checksums"
@@ -58,8 +72,8 @@ echo "== version and checksums"
     echo "renderer: shadPS4 b4e7ae776071ceb1dd35004577a8719481e1d258 + gpu/patches/shadps4-local.patch"
     echo "supported game build: CUSA01593 version 01.02 (eboot.bin sha256 d43b7b5db10b5808c06691b27ef0ce1b5d27da6b1e07d811db5bea125ceaed54)"
     echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ) with $(x86_64-w64-mingw32-g++-posix --version | head -1); four gpu units with $(clang++-18 --version | head -1)"
-    tmpd=$(mktemp -d); tar -xzf "$rel/source/JStarsReborn-$version-source.tar.gz" -C "$tmpd"
-    echo "source tree digest: $(cd "$tmpd/JStarsReborn" && find . -type f | LC_ALL=C sort | xargs -d '\n' sha256sum | sha256sum | cut -c1-16) (sha256 of the sorted per-file sha256 list of the source archive)"
+    tmpd=$(mktemp -d); tar -xzf "$rel/source/$rel_base-$version-source.tar.gz" -C "$tmpd"
+    echo "source tree digest: $(cd "$tmpd/$rel_base" && find . -type f | LC_ALL=C sort | xargs -d '\n' sha256sum | sha256sum | cut -c1-16) (sha256 of the sorted per-file sha256 list of the source archive)"
     rm -rf "$tmpd"
     echo "contains no game files, keys or firmware; needs your own decrypted CUSA01593 01.02 dump"
 } > "$rel/VERSION.txt"

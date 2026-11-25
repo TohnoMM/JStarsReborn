@@ -36,6 +36,14 @@ Third-party libraries under `gpu/vendor/externals/` (revisions and licenses in `
 
 The Windows audio path uses WASAPI (shared mode) and the video path uses the Vulkan loader supplied by the GPU driver; neither is redistributed. Because this runtime links the GPL-2.0-or-later renderer, the combined runtime executable is GPL-2.0-or-later. No game code, game asset, key or firmware is included.
 
+## Movie decoding (optional FFmpeg backend, LGPL-2.1-or-later)
+
+Builds with `-ConVideos` / `FFMPEG_WIN_DIR` link the FFmpeg shared libraries (libavformat, libavcodec,
+libavutil, LGPL-2.1-or-later) from a BtbN `win64-lgpl-shared` build and ship its DLLs next to the
+runtime (see `LICENSES/FFmpeg-LICENSE.txt` in such releases and `docs/MOVIES.md`). Only the native
+demuxers/decoders are used (no external codec libraries). Without this backend the runtime contains no
+FFmpeg code and movies are skipped.
+
 ## Online libraries (`gpu/jsnet/`, GPL-2.0-or-later)
 
 shadPS4 v0.20.0's network, NP and shadNet client sources (GPL-2.0-or-later), as vendored and fixed by the Bloodborne PC port (bbport,

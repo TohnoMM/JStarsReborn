@@ -7,13 +7,21 @@
 #   4. Ejecuta --selftest-host y --cpu-features.
 #
 # Uso: doble clic en COMPILAR_WINDOWS.bat, o en PowerShell:
-#   powershell -ExecutionPolicy Bypass -File COMPILAR_WINDOWS.ps1
+#   powershell -ExecutionPolicy Bypass -File COMPILAR_WINDOWS.ps1 [-ConVideos]
 #
-# Salida: C:\builds\jstars-isa-fix-001\jstars-boot-native.exe
+# Con -ConVideos descarga ademas FFmpeg (~85 MB) y compila con decodificacion
+# real de videos (los videos del juego se ven y se oyen). Sin el flag, los
+# videos se saltan como antes (ver docs/MOVIES.md).
+#
+# Salida: C:\builds\jstars-isa-fix-001\jstars-boot-native.exe (+ FFmpeg DLLs si -ConVideos)
 # El .exe solo prueba servicios de host (--selftest-host). No es el juego completo:
 # el runtime GPU/launcher se sigue compilando con el cross-build Linux documentado
 # en docs/BUILD_RELEASE.md. Sirve para verificar que el fix compila y pasa los
 # vectores ISA (MOVBE + BMI1) en tu PC.
+
+param(
+    [switch]$ConVideos
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -53,6 +61,38 @@ if (-not (Test-Path (Join-Path $LlvmBin 'clang.exe'))) {
 
 if (-not (Test-Path (Join-Path $LlvmBin 'clang++.exe'))) { throw "--llvm-bin incompleto: falta clang++.exe en $LlvmBin" }
 
+# 2b. FFmpeg (solo con -ConVideos): decodificacion real de videos (docs/MOVIES.md).
+#     Se cachea en $CacheDir igual que la toolchain.
+$FfmpegArgs = @()
+if ($ConVideos) {
+    Write-Host '== FFmpeg (videos): activado con -ConVideos ==' -ForegroundColor Cyan
+    $FfmpegZipName = 'ffmpeg-master-latest-win64-lgpl-shared.zip'
+    $FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$FfmpegZipName"
+    $FfmpegZip = Join-Path $CacheDir $FfmpegZipName
+    $found = Get-ChildItem -Path $CacheDir -Recurse -Filter 'avformat.h' -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match 'libavformat' } | Select-Object -First 1
+    if ($found) {
+        $FfmpegRoot = Split-Path (Split-Path (Split-Path $found.FullName -Parent) -Parent) -Parent
+        Write-Host "FFmpeg OK (cache): $FfmpegRoot"
+    } else {
+        Write-Host "Descargando FFmpeg shared (~85 MB, solo la primera vez)..." -ForegroundColor Yellow
+        if (-not (Test-Path $FfmpegZip)) {
+            New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+            Invoke-WebRequest -Uri $FfmpegUrl -OutFile $FfmpegZip -UseBasicParsing
+        }
+        Write-Host 'Extrayendo FFmpeg...'
+        Expand-Archive -Path $FfmpegZip -DestinationPath $CacheDir -Force
+        $found = Get-ChildItem -Path $CacheDir -Recurse -Filter 'avformat.h' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'libavformat' } | Select-Object -First 1
+        if (-not $found) { throw 'No se encontro include/libavformat/avformat.h en el ZIP de FFmpeg' }
+        $FfmpegRoot = Split-Path (Split-Path (Split-Path $found.FullName -Parent) -Parent) -Parent
+        Write-Host "FFmpeg OK: $FfmpegRoot"
+    }
+    $FfmpegArgs = @('--ffmpeg-dir', $FfmpegRoot)
+} else {
+    Write-Host 'Videos: modo skip (sin -ConVideos los videos se saltan; ver docs/MOVIES.md)'
+}
+
 # 3. Compilar (el script exige un directorio de salida NUEVO o vacio, fuera del arbol fuente)
 if (Test-Path $OutDir) {
     Write-Host "El directorio de salida ya existe: $OutDir" -ForegroundColor Yellow
@@ -63,7 +103,8 @@ if (Test-Path $OutDir) {
 Write-Host "Compilando en $OutDir ..."
 & python (Join-Path $RepoRoot 'tools\windows_build\build_runtime.py') `
     --llvm-bin $LlvmBin `
-    --out-dir $OutDir
+    --out-dir $OutDir `
+    @FfmpegArgs
 if ($LASTEXITCODE -ne 0) { throw "Fallo la compilacion. Mira $OutDir\compile.log y $OutDir\link.log" }
 
 $exe = Join-Path $OutDir 'jstars-boot-native.exe'

@@ -505,6 +505,9 @@ static int jsi_add_site(uintptr_t addr, const uint8_t *orig15) {
     return 1;
 }
 
+// Test hook for --selftest-host: 1 when jsi_patch_code[_ex] rewrote the instruction at addr.
+int jsi_is_patched(const void *addr) { return jsi_find_site((uintptr_t)addr) != NULL; }
+
 static int jsi_is_prefix_byte(uint8_t c) {
     return c == 0x66 || c == 0x67 || c == 0xF0 || c == 0xF2 || c == 0xF3 ||
            c == 0x2E || c == 0x36 || c == 0x3E || c == 0x26 || c == 0x64 || c == 0x65;

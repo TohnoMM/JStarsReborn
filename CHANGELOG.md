@@ -1,5 +1,20 @@
 # Change log
 
+## Unreleased (movies: optional FFmpeg backend)
+
+- **Movies can now play instead of being skipped** (`runtime/jstars_avplayer.c`, `docs/MOVIES.md`).
+  `libSceAvPlayer` was a diagnostic stub (`StreamCount` 0, `IsActive` false: the game treated every
+  movie as finished) because no decoder existed. The player now has two build modes: without
+  `JSTARS_HAS_FFMPEG` it is the same stub as before; with it (FFmpeg shared libs) it demuxes and
+  decodes for real (NV12 video via `GetVideoData[Ex]`, S16 PCM via `GetAudioData`, PLAY/PAUSE/STOP
+  events, looping, seek), following fpPS4's open-source AvPlayer as reference. New: `InitEx`,
+  `PostInit`, `AddSourceEx`, `GetStreamInfo`, `DisableStream`, `GetVideoData`, `GetAudioData`,
+  `Pause`, `Resume`, `CurrentTime`, `JumpToTime`, `SetAvSyncMode`, `SetLogCallback`, plus Sony ABI
+  size asserts in `--selftest-host`. Windows one-click: `COMPILAR_WINDOWS.ps1 -ConVideos`
+  (downloads the BtbN `win64-lgpl-shared` build, DLLs land next to the exe). Linux:
+  `make JSTARS_FFMPEG=1` / `FFMPEG_WIN_DIR=... tools/build_release.sh`. Real on-hardware movie
+  playback is not verified yet (needs an FFmpeg build played until a cutscene).
+
 ## Unreleased (issue #7: Ivy Bridge / Sandy Bridge illegal instruction)
 
 - **Pre-Haswell CPUs no longer die at `libc.prx+0x2f988`.** The runtime logs the host CPU sets at startup

@@ -1,0 +1,62 @@
+# Compilar en Windows (fix issue #7)
+
+> Respuesta corta: desde este chat no puedo dejarte un `.exe` ya compilado,
+> porque el ejecutable Windows (PE/COFF) necesita el SDK de Windows + llvm-mingw
+> (~182 MB) y el enlace final del proyecto, y este entorno es un sandbox
+> WebAssembly sin esos headers. Lo que sí hice: dejarte la compilación en
+> **un doble clic** en tu PC.
+
+## Opción A (recomendada): doble clic
+
+1. Descomprime `JStarsReborn-ISAfix-fuentes.zip` donde quieras.
+2. Instala **Python 3.11 o superior** (marca "Add to PATH" durante la instalación).
+3. Doble clic en **`COMPILAR_WINDOWS.bat`**.
+   - La primera vez descarga llvm-mingw 20261020 UCRT x86_64 (~182 MB) a
+     `%USERPROFILE%\builds\_toolchains` y lo reutiliza después.
+   - Compila con `tools/windows_build/build_runtime.py` (el mismo script verificado
+     del proyecto: 266 checks en hardware limpio).
+   - Ejecuta `--cpu-features` (verás `CPU: ...`, p. ej. `missing: BMI1, ...` en tu i7-3770)
+     y `--selftest-host` (debe terminar con 0 fallos, incluidos los vectores nuevos
+     MOVBE/ANDN/BEXTR/BLSI/BLSMSK/BLSR).
+4. El binario queda en `C:\builds\jstars-isa-fix-001\jstars-boot-native.exe`.
+
+## Qué es ese .exe (importante)
+
+Es el **runtime de servicios de host**: prueba CPU, memoria, ficheros, red local,
+audiohost, input, etc. **No es el juego** ni incluye el renderer Vulkan.
+El juego completo (launcher `JStarsReborn.exe` + `runtime\jstars-runtime.exe` con GPU)
+se compila con el cross-build Linux documentado en `docs/BUILD_RELEASE.md`
+(mingw-w64 + clang-18 + GPU lib, ~30 min). Ese proceso no cambió; este fix
+(`runtime/jstars_isa.c`, `jstars_os.c`, `jstars_loader.c`, vectores en
+`jstars_selftest.c`) viaja dentro y compila igual allí porque los includes
+están protegidos con `#ifdef _WIN32`.
+
+## Opción B: manual (si el .bat falla)
+
+```powershell
+# 1. Toolchain (una vez):
+Invoke-WebRequest -Uri https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-x86_64.zip -OutFile $env:USERPROFILE\builds\_toolchains\llvm-mingw.zip
+Expand-Archive $env:USERPROFILE\builds\_toolchains\llvm-mingw.zip $env:USERPROFILE\builds\_toolchains -Force
+
+# 2. Compilar (cambia OUT por un directorio nuevo/vacío fuera del fuente):
+python tools\windows_build\build_runtime.py --llvm-bin $env:USERPROFILE\builds\_toolchains\llvm-mingw-20261020-ucrt-x86_64\bin --out-dir C:\builds\jstars-manual-001
+
+# 3. Probar:
+C:\builds\jstars-manual-001\jstars-boot-native.exe --cpu-features
+C:\builds\jstars-manual-001\jstars-boot-native.exe --selftest-host --log C:\builds\jstars-manual-001\selftest.log
+```
+
+## Ficheros del fix (ya incluidos en este ZIP)
+
+- `runtime/jstars_isa.h` / `runtime/jstars_isa.c` (nuevo): CPUID, emulación MOVBE + BMI1, decode LZCNT/TZCNT.
+- `runtime/jstars_os.h` / `runtime/jstars_os.c`: `rflags` en `OsFault`, prehook ISA, `os_safe_write`.
+- `runtime/jstars_loader.c`: log de CPU al arrancar, `--cpu-features`, dump de 16 bytes + mnemónico en fallo.
+- `runtime/Makefile`: `jstars_isa.c` en `SRC` (lo recoge `build_runtime.py` automáticamente).
+- `runtime/jstars_selftest.c`: vectores ISA con bytes fijos (no necesitan BMI1 en el host).
+- `CHANGELOG.md`: entrada "Unreleased (issue #7)".
+- `COMPILAR_WINDOWS.bat` / `COMPILAR_WINDOWS.ps1` / este fichero (ayuda de compilación, no parte del upstream).
+
+## Si algo falla
+
+Pega el contenido de `C:\builds\jstars-*\compile.log`, `link.log` y `selftest-host.log`
+(o el mensaje rojo de PowerShell) y lo miramos.

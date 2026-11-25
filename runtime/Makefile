@@ -4,14 +4,26 @@ CC ?= gcc
 CFLAGS ?= -std=gnu2x -O2 -g -Wall -Wextra
 SRC = jstars_loader.c jstars_net.c jstars_rooms.c jstars_rt.c jstars_kernel.c jstars_memory.c jstars_system.c jstars_input.c jstars_av.c jstars_os.c jstars_gpu_host.c jstars_thunk.c jstars_audit.c jstars_selftest.c jstars_fs.c jstars_evf.c jstars_platform.c jstars_savedata.c jstars_avplayer.c jstars_audiohost.c jstars_sonypad.c jstars_isa.c
 jstars-boot: $(SRC) jstars_rt.h
-	$(CC) $(CFLAGS) -o $@ $(SRC) -lpthread -lm
+	$(CC) $(CFLAGS) $(FFMPEG_CFLAGS) -o $@ $(SRC) $(FFMPEG_LIBS) -lpthread -lm
 clean:
 	rm -f jstars-boot
 
 # Windows x64 build (static, winpthreads). Cross-compiled here; run under Wine for structural checks.
 # Wine is not Windows: only a run on a Windows machine counts as Windows evidence.
+# Optional FFmpeg movie decoding (docs/MOVIES.md). Two ways to enable:
+#   Linux native:  make JSTARS_FFMPEG=1 jstars-boot   (needs libavformat-dev libavcodec-dev libavutil-dev)
+#   mingw cross:   make FFMPEG_DIR=<BtbN win64 shared tree with include/ + bin/*.dll> jstars-boot-gpu.exe
+# Without either, movies are skipped (the previous behavior).
+ifdef JSTARS_FFMPEG
+FFMPEG_CFLAGS := -DJSTARS_HAS_FFMPEG $(shell pkg-config --cflags libavformat libavcodec libavutil)
+FFMPEG_LIBS := $(shell pkg-config --libs libavformat libavcodec libavutil)
+endif
+ifdef FFMPEG_DIR
+FFMPEG_CFLAGS := -DJSTARS_HAS_FFMPEG -I$(FFMPEG_DIR)/include
+FFMPEG_LIBS := $(wildcard $(FFMPEG_DIR)/bin/avformat-*.dll) $(wildcard $(FFMPEG_DIR)/bin/avcodec-*.dll) $(wildcard $(FFMPEG_DIR)/bin/avutil-*.dll)
+endif
 jstars-boot.exe: $(SRC) jstars_rt.h jstars_os.h
-	x86_64-w64-mingw32-gcc-posix $(CFLAGS) -static -o $@ $(SRC) -lws2_32 -lole32 -luser32 -ldbghelp -lshell32 -lpthread -lm
+	x86_64-w64-mingw32-gcc-posix $(CFLAGS) $(FFMPEG_CFLAGS) -static -o $@ $(SRC) $(FFMPEG_LIBS) -lws2_32 -lole32 -luser32 -ldbghelp -lshell32 -lpthread -lm
 
 # ---- GPU-linked runtime (checkpoint 0.3.x): the shadPS4-derived renderer in ../gpu is linked in --------
 # GPU_LIB points at libjstars_gpu.a built by `cmake -S ../gpu -B build-gpu && cmake --build build-gpu`.
@@ -19,8 +31,8 @@ jstars-boot.exe: $(SRC) jstars_rt.h jstars_os.h
 GPU_LIB ?= ../gpu/build/libjstars_gpu.a
 CXX ?= g++
 jstars-boot-gpu: $(SRC) jstars_rt.h $(GPU_LIB)
-	$(CC) $(CFLAGS) -DJSTARS_GPU -I../gpu -c $(filter %.c,$(SRC)) && \
-	$(CXX) -o $@ $(patsubst %.c,%.o,$(filter %.c,$(SRC))) $(GPU_LIB) -lX11 -lvulkan -ldl -lpthread -lm
+	$(CC) $(CFLAGS) $(FFMPEG_CFLAGS) -DJSTARS_GPU -I../gpu -c $(filter %.c,$(SRC)) && \
+	$(CXX) -o $@ $(patsubst %.c,%.o,$(filter %.c,$(SRC))) $(GPU_LIB) $(FFMPEG_LIBS) -lX11 -lvulkan -ldl -lpthread -lm
 	rm -f $(patsubst %.c,%.o,$(filter %.c,$(SRC)))
 
 # Windows x64, GPU-linked (cross-compiled with mingw-w64; GPL-2.0-or-later as a whole). The Vulkan loader
@@ -37,8 +49,8 @@ JSNET_CFLAGS = -DJSTARS_JSNET
 JSNET_LIBS = $(JSNET_LIB_WIN) -L$(JSNET_DEPS)/lib -lprotobuf -lminiupnpc -lssl -lcrypto -lz -liphlpapi -lcrypt32
 endif
 jstars-boot-gpu.exe: $(SRC) jstars_rt.h jstars_os.h $(GPU_LIB_WIN)
-	mkdir -p obj-win && $(WIN_CC) $(CFLAGS) -DJSTARS_GPU $(JSNET_CFLAGS) -I../gpu -c $(filter %.c,$(SRC)) && mv *.o obj-win/ && \
-	$(WIN_CXX) -static -static-libgcc -static-libstdc++ -Wl,--allow-multiple-definition -o $@ $(addprefix obj-win/,$(patsubst %.c,%.o,$(filter %.c,$(SRC)))) $(JSNET_LIBS) $(GPU_LIB_WIN) \
+	mkdir -p obj-win && $(WIN_CC) $(CFLAGS) $(FFMPEG_CFLAGS) -DJSTARS_GPU $(JSNET_CFLAGS) -I../gpu -c $(filter %.c,$(SRC)) && mv *.o obj-win/ && \
+	$(WIN_CXX) -static -static-libgcc -static-libstdc++ -Wl,--allow-multiple-definition -o $@ $(addprefix obj-win/,$(patsubst %.c,%.o,$(filter %.c,$(SRC)))) $(JSNET_LIBS) $(GPU_LIB_WIN) $(FFMPEG_LIBS) \
 	  -lws2_32 -lmswsock -luser32 -lgdi32 -ldbghelp -lbcrypt -lole32 -lshell32 -lshlwapi -ladvapi32 -lwinmm -lntdll -lpthread
 	rm -rf obj-win
 

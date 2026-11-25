@@ -1097,6 +1097,142 @@ int rt_selftest_host(const char* scratch_dir) {
             CHECK(1, "isa: cpu feature words readable");
         }
     }
+    { // ISA load-time rewriting: jsi_patch_code_ex (LZCNT/TZCNT -> UD2) and jsi_fast_build/patch
+      // (BMI1 inline blocks). Pure byte vectors; nothing executes here. Patched sites stay in the
+      // process side table (stack addresses, a handful), which is harmless.
+      // LZCNT + TZCNT rewritten, only the first two bytes become UD2 (0F 0B).
+        {
+            uint8_t code[] = {0xF3, 0x0F, 0xBD, 0xC1, 0x90, 0xF3, 0x0F, 0xBC, 0xC2};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 1, 1) == 2, "isa patch: LZCNT+TZCNT rewritten");
+            CHECK(code[0] == 0x0F && code[1] == 0x0B && code[2] == 0xBD && code[3] == 0xC1 && code[4] == 0x90 &&
+                  code[5] == 0x0F && code[6] == 0x0B && code[7] == 0xBC && code[8] == 0xC2,
+                  "isa patch: only the first two bytes become UD2, the rest is untouched");
+            CHECK(jsi_is_patched(&code[0]) && jsi_is_patched(&code[5]) && !jsi_is_patched(&code[4]),
+                  "isa patch: the side table holds exactly the two rewritten sites");
+        }
+        // need_tz = 0: the TZCNT is left alone.
+        {
+            uint8_t code[] = {0xF3, 0x0F, 0xBD, 0xC1, 0xF3, 0x0F, 0xBC, 0xC2};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 1, 0) == 1, "isa patch: need_tz=0 patches only LZCNT");
+            CHECK(code[0] == 0x0F && code[1] == 0x0B && code[4] == 0xF3 && code[6] == 0xBC,
+                  "isa patch: the TZCNT bytes are untouched when need_tz=0");
+        }
+        // need 0,0: nothing is touched and nothing is reported.
+        {
+            uint8_t code[] = {0xF3, 0x0F, 0xBD, 0xC1};
+            static const uint8_t orig[] = {0xF3, 0x0F, 0xBD, 0xC1};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 0, 0) == 0 && !memcmp(code, orig, sizeof code),
+                  "isa patch: need 0,0 leaves the code alone");
+        }
+        // REX-prefixed LZCNT (F3 41 0F BD C8): the REX byte is part of the 5-byte instruction.
+        {
+            uint8_t code[] = {0xF3, 0x41, 0x0F, 0xBD, 0xC8};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 1, 1) == 1, "isa patch: REX-prefixed LZCNT rewritten");
+            CHECK(code[0] == 0x0F && code[1] == 0x0B, "isa patch: REX form starts with UD2");
+            CHECK(jsi_is_patched(&code[0]), "isa patch: REX form is in the side table");
+        }
+        // F3-prefixed instructions that are not LZCNT/TZCNT are ignored (PAUSE, POPCNT).
+        {
+            uint8_t code[] = {0xF3, 0x90, 0xF3, 0x0F, 0xB8, 0xC1};
+            static const uint8_t orig[] = {0xF3, 0x90, 0xF3, 0x0F, 0xB8, 0xC1};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 1, 1) == 0 && !memcmp(code, orig, sizeof code),
+                  "isa patch: PAUSE and POPCNT are not LZCNT/TZCNT");
+        }
+        // Exact-fit buffer (4 bytes) patches; a truncated tail cannot crash and is skipped.
+        {
+            uint8_t code[] = {0xF3, 0x0F, 0xBD, 0xC1};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 1, 1) == 1 && code[0] == 0x0F && code[1] == 0x0B,
+                  "isa patch: exact-fit 4-byte LZCNT is rewritten");
+        }
+        {
+            uint8_t code[] = {0xF3, 0x0F, 0xBD};
+            static const uint8_t orig[] = {0xF3, 0x0F, 0xBD};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 1, 1) == 0 && !memcmp(code, orig, sizeof code),
+                  "isa patch: truncated tail is skipped, not crashed on");
+        }
+        // Two adjacent LZCNTs: the length skip lands exactly on the next one.
+        {
+            uint8_t code[] = {0xF3, 0x0F, 0xBD, 0xC1, 0xF3, 0x0F, 0xBD, 0xC2};
+            CHECK(jsi_patch_code_ex(code, sizeof code, 1, 1) == 2 && code[4] == 0x0F && code[5] == 0x0B,
+                  "isa patch: adjacent LZCNTs are both rewritten");
+        }
+        // The env A/B switch disables the CPUID-driven entry point on any host.
+        // (Windows has no setenv/unsetenv: _putenv with "NAME=" removes the variable.)
+        {
+            uint8_t code[] = {0xF3, 0x0F, 0xBD, 0xC1};
+            size_t n;
+#ifdef _WIN32
+            _putenv("JSTARS_NO_LZCNT_PATCH=1");
+            n = jsi_patch_code(code, sizeof code);
+            _putenv("JSTARS_NO_LZCNT_PATCH=");
+#else
+            setenv("JSTARS_NO_LZCNT_PATCH", "1", 1);
+            n = jsi_patch_code(code, sizeof code);
+            unsetenv("JSTARS_NO_LZCNT_PATCH");
+#endif
+            CHECK(n == 0 && code[0] == 0xF3, "isa patch: JSTARS_NO_LZCNT_PATCH disables the rewrite");
+        }
+        // jsi_fast_build: ANDN eax,ecx,edx -> mov/not/and block ending in jmp site+len.
+        {
+            static const uint8_t insn[] = {0xC4, 0xE2, 0x70, 0xF2, 0xC2};
+            uint8_t out[256]; size_t len = 0;
+            size_t n = jsi_fast_build(out, sizeof out, 0x1000000u, insn, sizeof insn, 0x800000u, &len);
+            CHECK(n > 0 && len == 5, "isa fast: ANDN reg form builds a block, original len 5");
+            CHECK(out[0] == 0x40 && out[1] == 0x89 && out[2] == 0xC8, "isa fast: ANDN block starts with mov eax,ecx");
+            int32_t rel = 0; if (n >= 5) memcpy(&rel, out + n - 4, 4);
+            CHECK(n >= 5 && out[n - 5] == 0xE9 &&
+                  (int64_t)0x1000000u + (int64_t)n + (int64_t)rel == (int64_t)0x800005u,
+                  "isa fast: block ends with jmp rel32 back to site+len");
+        }
+        // The other four BMI1 ops build 5-byte blocks too.
+        {
+            static const uint8_t blsr[] = {0xC4, 0xE2, 0x78, 0xF3, 0xC9};
+            static const uint8_t blsmsk[] = {0xC4, 0xE2, 0x78, 0xF3, 0xD1};
+            static const uint8_t blsi[] = {0xC4, 0xE2, 0x78, 0xF3, 0xD9};
+            static const uint8_t bextr[] = {0xC4, 0xE2, 0x68, 0xF7, 0xC1};
+            uint8_t out[256]; size_t len = 0;
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, blsr, sizeof blsr, 0x800000u, &len) > 0 && len == 5, "isa fast: BLSR builds");
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, blsmsk, sizeof blsmsk, 0x800000u, &len) > 0 && len == 5, "isa fast: BLSMSK builds");
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, blsi, sizeof blsi, 0x800000u, &len) > 0 && len == 5, "isa fast: BLSI builds");
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, bextr, sizeof bextr, 0x800000u, &len) > 0 && len == 5, "isa fast: BEXTR builds");
+        }
+        // Memory-operand ANDN (mov load first): 0x8B right after the REX.
+        {
+            static const uint8_t insn[] = {0xC4, 0xE2, 0x70, 0xF2, 0x02}; // ANDN eax,ecx,[rdx]
+            uint8_t out[256]; size_t len = 0;
+            size_t n = jsi_fast_build(out, sizeof out, 0x1000000u, insn, sizeof insn, 0x800000u, &len);
+            CHECK(n > 0 && len == 5 && out[1] == 0x8B, "isa fast: ANDN mem form starts with a mov load");
+        }
+        // Rejected forms build nothing: RIP-relative, unknown VEX opcode, rsp destination/operand.
+        {
+            static const uint8_t rip[] = {0xC4, 0xE2, 0x70, 0xF2, 0x05, 0x78, 0x56, 0x34, 0x12};
+            static const uint8_t bad[] = {0xC4, 0xE2, 0x70, 0xF0, 0xC2};
+            static const uint8_t rspdst[] = {0xC4, 0xE2, 0x70, 0xF2, 0xE2}; // dst = esp
+            static const uint8_t rspsrc[] = {0xC4, 0xE2, 0x70, 0xF2, 0xC4}; // src = esp
+            static const uint8_t andn[] = {0xC4, 0xE2, 0x70, 0xF2, 0xC2};
+            uint8_t out[256]; size_t len = 0;
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, rip, sizeof rip, 0x800000u, &len) == 0, "isa fast: RIP-relative form rejected");
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, bad, sizeof bad, 0x800000u, &len) == 0, "isa fast: unknown VEX opcode rejected");
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, rspdst, sizeof rspdst, 0x800000u, &len) == 0, "isa fast: rsp destination rejected");
+            CHECK(jsi_fast_build(out, sizeof out, 0x1000000u, rspsrc, sizeof rspsrc, 0x800000u, &len) == 0, "isa fast: rsp register operand rejected");
+            CHECK(jsi_fast_build(out, 8, 0x1000000u, andn, sizeof andn, 0x800000u, &len) == 0, "isa fast: tiny output buffer rejected");
+        }
+        // jsi_fast_patch on a synthetic image: one site rewritten, others rejected, jmp lands in jit.
+        {
+            uint8_t image[64]; memset(image, 0, sizeof image);
+            static const uint8_t andn[] = {0xC4, 0xE2, 0x70, 0xF2, 0xC2};
+            memcpy(image + 0x10, andn, sizeof andn);
+            static const uint32_t sites[] = {0x10, 0x3C, 0x20}; // ok, out of bounds, zeros (unparseable)
+            uint8_t jit[512]; memset(jit, 0xCC, sizeof jit);
+            size_t n = jsi_fast_patch(image, sizeof image, jit, sizeof jit, sites, sizeof sites / sizeof *sites);
+            int32_t rel = 0; memcpy(&rel, image + 0x11, 4);
+            CHECK(n == 1, "isa fast: one of three synthetic sites rewritten");
+            CHECK(image[0x10] == 0xE9 &&
+                  (uint64_t)(uintptr_t)(image + 0x10) + 5 + (uint64_t)(int64_t)rel == (uint64_t)(uintptr_t)jit,
+                  "isa fast: site holds jmp rel32 to the start of the jit area");
+            CHECK(image[0x20] == 0, "isa fast: unparseable site left untouched");
+        }
+    }
     rt_logf("selftest-host: %d checks, %d failed", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

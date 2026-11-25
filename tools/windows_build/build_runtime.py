@@ -30,6 +30,9 @@ def main() -> int:
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument('--gpu-library', type=Path,
                         help='Optional compatible libc++ renderer .a; GCC/libstdc++ archives are incompatible')
+    parser.add_argument('--ffmpeg-dir', type=Path, default=None,
+                        help='Optional FFmpeg shared tree (BtbN win64-lgpl-shared layout: include/ + bin/*.dll); '
+                             'enables real movie decoding (docs/MOVIES.md). Without it movies are skipped.')
     args = parser.parse_args()
     if os.name != 'nt':
         parser.error('This entry point is for native Windows builds.')
@@ -57,6 +60,20 @@ def main() -> int:
     gpu = args.gpu_library.resolve() if args.gpu_library else None
     if gpu and not gpu.is_file():
         parser.error('--gpu-library does not exist')
+    ffmpeg = args.ffmpeg_dir.resolve() if args.ffmpeg_dir else None
+    ffmpeg_dlls: list[Path] = []
+    if ffmpeg:
+        if not (ffmpeg / 'include' / 'libavformat' / 'avformat.h').is_file():
+            parser.error('--ffmpeg-dir must contain include/libavformat/avformat.h')
+        bindir = ffmpeg / 'bin'
+        for prefix in ('avformat-', 'avcodec-', 'avutil-'):
+            found = sorted(bindir.glob(prefix + '*.dll'))
+            if not found:
+                parser.error(f'--ffmpeg-dir/bin has no {prefix}*.dll (need the shared build DLLs)')
+            if len(found) > 1:
+                print(f'note: several {prefix}*.dll, using {found[0].name}', flush=True)
+            ffmpeg_dlls.append(found[0])
+        print('FFmpeg movie decoding enabled:', ', '.join(p.name for p in ffmpeg_dlls), flush=True)
     out.mkdir(parents=True, exist_ok=True)
     manifest = {
         'started_utc': datetime.now(timezone.utc).isoformat(),
@@ -71,6 +88,8 @@ def main() -> int:
         manifest['renderer'] = {'path': str(gpu), 'sha256': sha256(gpu)}
         for header in (source / 'gpu').glob('*.h'):
             manifest['inputs'][str(header.relative_to(source))] = sha256(header)
+    if ffmpeg:
+        manifest['ffmpeg'] = {'dir': str(ffmpeg), 'dlls': [p.name for p in ffmpeg_dlls]}
 
     def run(label: str, argv: list[str]) -> int:
         log = out / f'{label}.log'
@@ -87,6 +106,8 @@ def main() -> int:
         flags = ['--target=x86_64-w64-windows-gnu', '-std=gnu2x', '-O2', '-g', '-Wall', '-Wextra']
         if gpu:
             flags += ['-DJSTARS_GPU', '-I' + str(source / 'gpu')]
+        if ffmpeg:
+            flags += ['-DJSTARS_HAS_FFMPEG', '-I' + str(ffmpeg / 'include')]
         if run('compile', [str(clang), *flags, '-c', *map(str, sources)]):
             return 1
         exe = out / ('jstars-boot-gpu-native.exe' if gpu else 'jstars-boot-native.exe')
@@ -97,10 +118,18 @@ def main() -> int:
         if gpu:
             link += ['-Wl,--allow-multiple-definition', str(gpu), '-lmswsock', '-lgdi32',
                      '-lbcrypt', '-lshlwapi', '-ladvapi32', '-lwinmm', '-lntdll']
+        if ffmpeg:
+            # Link the shared-build DLLs directly (the linker imports their exports; no .lib needed).
+            link += [str(p) for p in ffmpeg_dlls]
         if run('link', link + libraries):
             print('Link failed; see link.log. The exported GCC/libstdc++ renderer is not '
                   'compatible with llvm-mingw libc++.', file=sys.stderr)
             return 1
+        if ffmpeg:
+            import shutil
+            for dll in sorted((ffmpeg / 'bin').glob('*.dll')):
+                shutil.copy2(dll, out / dll.name)
+            print('FFmpeg DLLs copied next to the exe:', ', '.join(sorted(p.name for p in (ffmpeg / 'bin').glob('*.dll'))))
         manifest['build_succeeded'] = True
         manifest['artifact'] = {'path': str(exe), 'sha256': sha256(exe)}
         print(f'Built {exe}\nSHA-256 {manifest["artifact"]["sha256"]}')

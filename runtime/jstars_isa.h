@@ -48,6 +48,8 @@ int jsi_handle_fault(const struct OsFault *f);
 // or when the environment variable JSTARS_NO_LZCNT_PATCH is set. Returns the number of sites patched.
 size_t jsi_patch_code(uint8_t *code, size_t size);
 size_t jsi_patch_code_ex(uint8_t *code, size_t size, int need_lz, int need_tz); // forced, for tests
+// Test hook: 1 when jsi_patch_code[_ex] rewrote the instruction at addr (side-table hit).
+int jsi_is_patched(const void *addr);
 
 // BMI1 fast path (see jstars_isa.c): rewrites the known hot ANDN/BEXTR/BLSR/BLSMSK/BLSI sites of J-Stars Victory
 // VS+ US 01.02 into jumps to inline code placed in `jit` (writable now, make it executable afterwards; it must be
