@@ -22,12 +22,13 @@ void* os_dm_map(void* hint, size_t len, int prot, uint64_t phys, int mode);
 void* os_alloc_aligned(size_t align, size_t size);
 void os_free_aligned(void* p);
 
-typedef struct {
+typedef struct OsFault {
     int signal;            // POSIX signal number, or Windows exception code
     int code;              // si_code / access type (0 read, 1 write, 8 execute on Windows)
     uintptr_t address;     // faulting data address (0 if none)
     uintptr_t rip, rsp;
     uint64_t gpr[16];      // rax rcx rdx rbx rsp rbp rsi rdi r8..r15
+    uint64_t rflags;
     void* native;          // host exception context: EXCEPTION_POINTERS* (Windows) / ucontext_t* (Linux)
 } OsFault;
 // The callback must not return (the loader logs and exits).
@@ -35,8 +36,14 @@ void os_install_fault_handler(void (*cb)(const OsFault*));
 // Runs before the fatal callback for memory-access faults. Returning non-zero means the fault was handled
 // (page-tracking fault of the GPU library) and the faulting instruction is retried.
 void os_set_fault_prehook(int (*hook)(const OsFault*));
+// ISA emulator prehook (jstars_isa.c): handles STATUS_ILLEGAL_INSTRUCTION / SIGILL by emulating
+// MOVBE/BMI1 in place and resuming. Separate from the GPU page-fault hook so the two never overwrite
+// each other; both are tried by the VEH/signal handler.
+void os_set_isa_prehook(int (*hook)(const OsFault*));
 // Copies up to len bytes; stops at the first unreadable page. Returns the bytes copied.
 size_t os_safe_read(void* dst, const void* src, size_t len);
+// Safe write counterpart (WriteProcessMemory / process_vm_writev on the current process).
+size_t os_safe_write(void* dst, const void* src, size_t len);
 
 // ---- files (paths are UTF-8; '/' separators are accepted on both hosts) ---------------------------------
 // Status codes are host-neutral; the console file layer (jstars_fs.c) maps them to console errno values.

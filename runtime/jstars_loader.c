@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include "jstars_rt.h"
 #include "jstars_os.h"
+#include "jstars_isa.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -162,6 +163,25 @@ static void fault(const OsFault* f) {
     static const char* rn[] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
     for (int i = 0; i < 16; ++i) rt_logf("  %-3s = 0x%016llx", rn[i], (unsigned long long)f->gpr[i]);
     rt_logf("  rip = 0x%016llx", (unsigned long long)f->rip);
+    rt_logf("  rflags = 0x%016llx", (unsigned long long)f->rflags);
+    { // Faulting bytes: identifies MOVBE/BMI1 vs something else without needing the game file.
+        uint8_t code[16];
+        size_t got = os_safe_read(code, (const void*)f->rip, sizeof code);
+        if (got) {
+            char hex[64] = {0};
+            size_t at = 0;
+            for (size_t i = 0; i < got && at + 3 < sizeof hex; ++i) at += (size_t)snprintf(hex + at, sizeof hex - at, "%02x%s", code[i], i + 1 < got ? " " : "");
+            rt_logf("  bytes at rip (%u): %s", (unsigned)got, hex);
+            // Best-effort decode so a Haswell instruction names itself in the log (no side effects).
+            {
+                size_t dl = 0; char mn[16] = {0};
+                if (jsi_decode(code, got, mn, sizeof mn, &dl))
+                    rt_logf("  isa: %s (+%u)", mn[0] ? mn : "?", (unsigned)dl);
+            }
+        } else {
+            rt_logf("  bytes at rip: unreadable");
+        }
+    }
     rt_logf("  faulting thread: %s", rt_current_thread_name());
     for (int i = 0; i < 24; ++i) {
         uintptr_t v = 0;
@@ -487,6 +507,16 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--lobby-peer") && i + 1 < argc) lobby_peers = argv[++i];
         else if (!strcmp(argv[i], "--trace-net")) trace_net = 1;
         else if (!strcmp(argv[i], "--trace-np")) trace_np = 1;
+        else if (!strcmp(argv[i], "--cpu-features")) {
+            JsiCpuWords w = jsi_cpu_words();
+            char fatal[128] = {0}, rw[128] = {0};
+            int nf = jsi_missing_fatal(w, fatal, sizeof fatal);
+            unsigned rwm = jsi_missing_rewritable(w, rw, sizeof rw);
+            if (nf) printf("CPU: missing fatal %s\n", fatal);
+            else if (rwm) printf("CPU: missing %s\n", rw);
+            else printf("CPU: complete\n");
+            return nf ? 20 : 0;
+        }
         else if (!strcmp(argv[i], "--trace-draws") && i + 1 < argc) { ++i; os_setenv("JGPU_TRACE_DRAWS", argv[i]); }
         else if (!strcmp(argv[i], "--capture-flips") && i + 1 < argc) g_capture_flips = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--capture-interval") && i + 1 < argc) g_capture_interval = atoi(argv[++i]);
@@ -500,6 +530,8 @@ int main(int argc, char** argv) {
     if (!boot) { fprintf(stderr, "--boot is required\n"); return 1; }
     rt_log_open(logpath);
     rt_logf("JStarsReborn runtime %s", JSTARS_RUNTIME_VERSION);
+    jsi_log_startup();
+    os_set_isa_prehook(jsi_handle_fault);
 #ifdef _WIN32
     // 1 ms timer resolution for this process (Windows' default tick is 15.6 ms): the game's own sleeps and waits, and the renderer's
     // vblank loop, otherwise wake only on that tick, which showed as frames alternating between 16 and 31 ms.
@@ -614,7 +646,8 @@ int main(int argc, char** argv) {
     size_t trap_bytes = (import_count * 32 + page) & ~(page - 1);
     size_t data_bytes = (import_count + 1) * page;
     size_t thunk_bytes = (rt_thunk_bytes(import_count) + page - 1) & ~(page - 1);
-    total_size = image_size + trap_bytes + data_bytes + thunk_bytes;
+    size_t jit_bytes = 64 * 1024;   // inline replacements for hot BMI1 instructions (jsi_fast_patch_hot)
+    total_size = image_size + trap_bytes + data_bytes + thunk_bytes + jit_bytes;
     void* want = (void*)0x200000000ull;
     void* mem = os_map_anon(want, total_size, OS_PROT_R | OS_PROT_W, OS_MAP_FIXED_NOREPLACE);
     if (!mem) mem = os_map_anon(NULL, total_size, OS_PROT_R | OS_PROT_W, OS_MAP_ANYWHERE);
@@ -623,6 +656,7 @@ int main(int argc, char** argv) {
     traps = image + image_size;
     data_traps = traps + trap_bytes;
     thunks = data_traps + data_bytes;
+    uint8_t* jit = thunks + thunk_bytes;
     rt_thunks_init(thunks, import_count);
     if (fread(image, 1, size, f) != size) fail("truncated image");
     fclose(f);
@@ -693,12 +727,22 @@ int main(int argc, char** argv) {
     }
     if (trace_projection) projection_trace_patch(widescreen_on, segs, ns, relocs, nr);
 
+    // CPUs without LZCNT/BMI1 run LZCNT/TZCNT as BSR/BSF without any fault (wrong results). Rewrite them to UD2 while the
+    // image is still writable; the ISA fault handler (jstars_isa.c) emulates each one. No-op on CPUs that have the sets.
+    for (uint64_t i = 0; i < ns; ++i)
+        if (segs[i].flags & 1) jsi_patch_code(image + segs[i].address, (size_t)segs[i].size);
+    // Hot BMI1 instructions (ANDN/BEXTR/BLSR...) would otherwise take a fault each time. Only for the build whose hot sites
+    // were measured; every other build keeps using the fault handler.
+    if (size == 11028540 && ns >= 1 && segs[0].size == 7536868 && (segs[0].flags & 1))
+        jsi_fast_patch_hot(image, (size_t)size, jit, jit_bytes);
+
     if (os_protect(image, image_size, 0)) fail("protect image");
     for (uint64_t i = 0; i < ns; ++i)
         if (os_protect(image + segs[i].address, (segs[i].size + page - 1) & ~(page - 1), prot_of(segs[i].flags))) fail("protect segment");
     os_protect(traps, trap_bytes, OS_PROT_R | OS_PROT_X);
     os_protect(data_traps, data_bytes, 0);
     os_protect(thunks, thunk_bytes, OS_PROT_R | OS_PROT_W | OS_PROT_X);
+    os_protect(jit, jit_bytes, OS_PROT_R | OS_PROT_X);
     os_install_fault_handler(fault);
 
     if (!stop_at_gnm) {

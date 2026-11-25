@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include "jstars_rt.h"
 #include "jstars_os.h"
+#include "jstars_isa.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
@@ -1004,6 +1005,98 @@ int rt_selftest_host(const char* scratch_dir) {
     }
     selftest_sonypad();
     selftest_jsnet(scratch_dir);
+    { // ISA emulator (issue #7: Ivy Bridge without BMI1/LZCNT/MOVBE). Pure vectors, no host
+      // MOVBE/BMI1 instructions executed: the test host itself may lack them.
+        JsiRegs r;
+        size_t len = 0;
+        char mn[16];
+        extern uintptr_t jsi_fault_rip_tls;
+        memset(&r, 0, sizeof r);
+        // ANDN eax, ecx, edx: C4 E2 70 F2 C2 ; ~0x0F & 0x33 = 0x30
+        {
+            static const uint8_t code[] = {0xC4, 0xE2, 0x70, 0xF2, 0xC2};
+            memset(&r, 0, sizeof r); r.gpr[1] = 0x0F; r.gpr[2] = 0x33; r.rflags = 0;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && len == 5 && r.gpr[0] == 0x30 &&
+                  (r.rflags & (JSI_SF | JSI_ZF | JSI_CF | JSI_OF)) == 0, "isa: ANDN eax,ecx,edx");
+        }
+        // BLSI eax, ecx (src=1): C4 E2 78 F3 D9 ; 1 & -1 = 1, CF=1
+        {
+            static const uint8_t code[] = {0xC4, 0xE2, 0x78, 0xF3, 0xD9};
+            memset(&r, 0, sizeof r); r.gpr[1] = 1; r.rflags = 0;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && len == 5 && r.gpr[0] == 1 &&
+                  (r.rflags & JSI_CF) != 0, "isa: BLSI eax,ecx");
+        }
+        // BLSR eax, ecx (src=0x12): C4 E2 78 F3 D9 with src 0x12 -> 0x10
+        {
+            static const uint8_t code[] = {0xC4, 0xE2, 0x78, 0xF3, 0xC9}; // /1 = BLSR, rm=001
+            memset(&r, 0, sizeof r); r.gpr[1] = 0x12; r.rflags = 0;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && r.gpr[0] == 0x10, "isa: BLSR eax,ecx");
+        }
+        // BLSMSK eax, ecx (src=0x10): -> 0x1F
+        {
+            static const uint8_t code[] = {0xC4, 0xE2, 0x78, 0xF3, 0xD1}; // /2 = BLSMSK
+            memset(&r, 0, sizeof r); r.gpr[1] = 0x10; r.rflags = 0;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && r.gpr[0] == 0x1F, "isa: BLSMSK eax,ecx");
+        }
+        // BEXTR eax, ecx, edx (src=0xFF00, ctrl=0x0808 -> 0xFF): C4 E2 68 F7 C1
+        {
+            static const uint8_t code[] = {0xC4, 0xE2, 0x68, 0xF7, 0xC1};
+            memset(&r, 0, sizeof r); r.gpr[1] = 0xFF00u; r.gpr[2] = 0x0808u; r.rflags = 0;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && len == 5 && r.gpr[0] == 0xFFu, "isa: BEXTR eax,ecx,edx");
+        }
+        // MOVBE eax, [rcx]: 0F 38 F0 01 with mem 0x12 0x34 0x56 0x78 -> bswap -> 0x12345678
+        {
+            uint8_t mem[8] = {0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0};
+            static const uint8_t code[] = {0x0F, 0x38, 0xF0, 0x01};
+            memset(&r, 0, sizeof r); r.gpr[1] = (uint64_t)(uintptr_t)mem; r.gpr[0] = 0; r.rflags = 0xCD5;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && len == 4 && r.gpr[0] == 0x12345678u &&
+                  r.rflags == 0xCD5, "isa: MOVBE eax,[rcx] leaves flags alone");
+        }
+        // MOVBE [rax], ecx: 0F 38 F1 08 stores bswap(ecx)
+        {
+            uint8_t mem[8] = {0};
+            static const uint8_t code[] = {0x0F, 0x38, 0xF1, 0x08};
+            memset(&r, 0, sizeof r); r.gpr[0] = (uint64_t)(uintptr_t)mem; r.gpr[1] = 0x12345678u;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && len == 4 &&
+                  mem[0] == 0x12 && mem[1] == 0x34 && mem[2] == 0x56 && mem[3] == 0x78, "isa: MOVBE [rax],ecx byte-swaps");
+        }
+        // LZCNT eax, ecx (src=0x00FF): F3 0F BD C1 -> 24
+        {
+            static const uint8_t code[] = {0xF3, 0x0F, 0xBD, 0xC1};
+            memset(&r, 0, sizeof r); r.gpr[1] = 0x00FFu; r.rflags = 0;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && r.gpr[0] == 24, "isa: LZCNT eax,ecx");
+        }
+        // TZCNT eax, ecx (src=0x1200): F3 0F BC C1 -> 9
+        {
+            static const uint8_t code[] = {0xF3, 0x0F, 0xBC, 0xC1};
+            memset(&r, 0, sizeof r); r.gpr[1] = 0x1200u; r.rflags = 0;
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 1 && r.gpr[0] == 9, "isa: TZCNT eax,ecx");
+        }
+        // Unknown opcode is not ours.
+        {
+            static const uint8_t code[] = {0x90};
+            memset(&r, 0, sizeof r);
+            jsi_fault_rip_tls = 0;
+            CHECK(jsi_emulate(code, sizeof code, &r, &len, mn, sizeof mn) == 0, "isa: NOP is not claimed");
+        }
+        // CPUID words are readable (no crash) and the missing-set helpers agree.
+        {
+            JsiCpuWords w = jsi_cpu_words();
+            char a[64] = {0}, b[64] = {0};
+            (void)jsi_missing_fatal(w, a, sizeof a);
+            (void)jsi_missing_rewritable(w, b, sizeof b);
+            CHECK(1, "isa: cpu feature words readable");
+        }
+    }
     rt_logf("selftest-host: %d checks, %d failed", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

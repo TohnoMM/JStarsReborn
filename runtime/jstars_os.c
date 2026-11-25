@@ -105,7 +105,7 @@ void os_free_aligned(void* p) { _aligned_free(p); }
 
 static void (*g_cb)(const OsFault*);
 static int (*g_prehook)(const OsFault*);
-
+static int (*g_isa_hook)(const OsFault*);
 // "module+0xRVA" for an address inside a loaded module (the host exe or a DLL); plain pointer otherwise.
 static const char* where_host(uintptr_t a, char* out, size_t n) {
     HMODULE m = NULL;
@@ -167,8 +167,10 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS* e) {
     f.rip = (uintptr_t)x->Rip; f.rsp = (uintptr_t)x->Rsp;
     uint64_t g[16] = {x->Rax, x->Rcx, x->Rdx, x->Rbx, x->Rsp, x->Rbp, x->Rsi, x->Rdi, x->R8, x->R9, x->R10, x->R11, x->R12, x->R13, x->R14, x->R15};
     memcpy(f.gpr, g, sizeof g);
+    f.rflags = (uint64_t)x->EFlags;
     f.native = e;
     if (c == EXCEPTION_ACCESS_VIOLATION && g_prehook && g_prehook(&f)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (c == EXCEPTION_ILLEGAL_INSTRUCTION && g_isa_hook && g_isa_hook(&f)) return EXCEPTION_CONTINUE_EXECUTION;
     g_cb(&f);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -178,10 +180,16 @@ void os_install_fault_handler(void (*cb)(const OsFault*)) {
     SetUnhandledExceptionFilter(unhandled_filter);
 }
 void os_set_fault_prehook(int (*hook)(const OsFault*)) { g_prehook = hook; }
+void os_set_isa_prehook(int (*hook)(const OsFault*)) { g_isa_hook = hook; }
 size_t os_safe_read(void* dst, const void* src, size_t len) {
     SIZE_T got = 0;
     ReadProcessMemory(GetCurrentProcess(), src, dst, len, &got); // a partial copy is reported through got
     return (size_t)got;
+}
+size_t os_safe_write(void* dst, const void* src, size_t len) {
+    SIZE_T put = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), dst, src, len, &put)) return 0;
+    return (size_t)put;
 }
 
 // ---- files (Windows) ------------------------------------------------------------------------------------
@@ -512,6 +520,7 @@ void os_free_aligned(void* p) { free(p); }
 
 static void (*g_cb)(const OsFault*);
 static int (*g_prehook)(const OsFault*);
+static int (*g_isa_hook)(const OsFault*);
 static void handler(int sig, siginfo_t* si, void* ctx) {
     ucontext_t* uc = ctx;
     OsFault f = {0};
@@ -519,12 +528,15 @@ static void handler(int sig, siginfo_t* si, void* ctx) {
     f.rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]; f.rsp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
     static const int idx[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI, REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
     for (int i = 0; i < 16; ++i) f.gpr[i] = (uint64_t)uc->uc_mcontext.gregs[idx[i]];
+    f.rflags = (uint64_t)uc->uc_mcontext.gregs[REG_EFL];
     f.native = uc;
     if (sig == SIGSEGV && g_prehook && g_prehook(&f)) return; // handled: the instruction is retried
+    if (sig == SIGILL && g_isa_hook && g_isa_hook(&f)) return; // emulated: RIP already advanced
     g_cb(&f);
     _exit(4);
 }
 void os_set_fault_prehook(int (*hook)(const OsFault*)) { g_prehook = hook; }
+void os_set_isa_prehook(int (*hook)(const OsFault*)) { g_isa_hook = hook; }
 size_t os_safe_read(void* dst, const void* src, size_t len) {
     struct iovec l = {dst, len}, r = {(void*)src, len};
     ssize_t n = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
@@ -539,6 +551,12 @@ size_t os_safe_read(void* dst, const void* src, size_t len) {
         done += chunk;
     }
     return done;
+}
+size_t os_safe_write(void* dst, const void* src, size_t len) {
+    struct iovec l = {(void*)src, len}, r = {dst, len};
+    ssize_t n = process_vm_writev(getpid(), &l, 1, &r, 1, 0);
+    if (n >= 0) return (size_t)n;
+    return 0;
 }
 void os_install_fault_handler(void (*cb)(const OsFault*)) {
     g_cb = cb;
